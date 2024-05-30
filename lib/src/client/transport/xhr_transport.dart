@@ -14,10 +14,11 @@
 // limitations under the License.
 
 import 'dart:async';
-import 'dart:html';
+import 'dart:js_interop';
 import 'dart:typed_data';
 
 import 'package:meta/meta.dart';
+import 'package:web/web.dart';
 
 import '../../client/call.dart';
 import '../../shared/message.dart';
@@ -27,10 +28,16 @@ import 'cors.dart' as cors;
 import 'transport.dart';
 import 'web_streams.dart';
 
+@JS('Uint8Array')
+@staticInterop
+class JSUint8Array {
+  external factory JSUint8Array(JSAny data);
+}
+
 const _contentTypeKey = 'Content-Type';
 
 class XhrTransportStream implements GrpcTransportStream {
-  final HttpRequest _request;
+  final XMLHttpRequest _request;
   final ErrorHandler _onError;
   final Function(XhrTransportStream stream) _onDone;
   bool _headersReceived = false;
@@ -49,19 +56,19 @@ class XhrTransportStream implements GrpcTransportStream {
       {required ErrorHandler onError, required onDone})
       : _onError = onError,
         _onDone = onDone {
-    _outgoingMessages.stream
-        .map(frame)
-        .listen((data) => _request.send(data), cancelOnError: true);
+    _outgoingMessages.stream.map(frame).listen((data) {
+      _sendRequest(data);
+    }, cancelOnError: true);
 
-    _request.onReadyStateChange.listen((data) {
+    _request.onReadyStateChange.listen((_) {
       if (_incomingProcessor.isClosed) {
         return;
       }
       switch (_request.readyState) {
-        case HttpRequest.HEADERS_RECEIVED:
+        case 2:
           _onHeadersReceived();
           break;
-        case HttpRequest.DONE:
+        case 4:
           _onRequestDone();
           _close();
           break;
@@ -81,13 +88,11 @@ class XhrTransportStream implements GrpcTransportStream {
       if (_incomingProcessor.isClosed) {
         return;
       }
-      // Use response over responseText as most browsers don't support
-      // using responseText during an onProgress event.
-      final responseString = _request.response as String;
+      final responseText = _request.responseText;
       final bytes = Uint8List.fromList(
-              responseString.substring(_requestBytesRead).codeUnits)
+              responseText.substring(_requestBytesRead).codeUnits)
           .buffer;
-      _requestBytesRead = responseString.length;
+      _requestBytesRead = responseText.length;
       _incomingProcessor.add(bytes);
     });
 
@@ -98,36 +103,37 @@ class XhrTransportStream implements GrpcTransportStream {
             onError: _onError, onDone: _incomingMessages.close);
   }
 
-  bool _validateResponseState() {
+  void _sendRequest(List<int> data) {
     try {
-      validateHttpStatusAndContentType(
-          _request.status, _request.responseHeaders,
-          rawResponse: _request.responseText);
-      return true;
-    } catch (e, st) {
-      _onError(e, st);
-      return false;
+      if (data.isEmpty) {
+        data = List.filled(5, 0);
+      }
+      final uint8Data = Int8List.fromList(data).toJS; // 변환을 사용
+      _request.send(uint8Data);
+    } catch (e) {
+      _onError(e, StackTrace.current);
     }
   }
 
   void _onHeadersReceived() {
     _headersReceived = true;
-    if (!_validateResponseState()) {
-      return;
-    }
-    _incomingMessages.add(GrpcMetadata(_request.responseHeaders));
+    final responseHeaders = _request.getAllResponseHeaders();
+    final headersMap = parseHeaders(responseHeaders);
+    final metadata = GrpcMetadata(headersMap);
+    _incomingMessages.add(metadata);
   }
 
   void _onRequestDone() {
-    if (!_headersReceived && !_validateResponseState()) {
-      return;
+    if (!_headersReceived) {
+      _onHeadersReceived();
     }
-    if (_request.response == null) {
+    if (_request.status != 200) {
       _onError(
-          GrpcError.unavailable('XhrConnection request null response', null,
+          GrpcError.unavailable(
+              'Request failed with status: ${_request.status}',
+              null,
               _request.responseText),
           StackTrace.current);
-      return;
     }
   }
 
@@ -146,7 +152,6 @@ class XhrTransportStream implements GrpcTransportStream {
 
 class XhrClientConnection implements ClientConnection {
   final Uri uri;
-
   final _requests = <XhrTransportStream>{};
 
   XhrClientConnection(this.uri);
@@ -156,23 +161,22 @@ class XhrClientConnection implements ClientConnection {
   @override
   String get scheme => uri.scheme;
 
-  void _initializeRequest(HttpRequest request, Map<String, String> metadata) {
-    for (final header in metadata.keys) {
-      request.setRequestHeader(header, metadata[header]!);
-    }
-    // Overriding the mimetype allows us to stream and parse the data
+  void _initializeRequest(
+      XMLHttpRequest request, Map<String, String> metadata) {
+    metadata.forEach((key, value) {
+      request.setRequestHeader(key, value);
+    });
     request.overrideMimeType('text/plain; charset=x-user-defined');
     request.responseType = 'text';
   }
 
   @visibleForTesting
-  HttpRequest createHttpRequest() => HttpRequest();
+  XMLHttpRequest createHttpRequest() => XMLHttpRequest();
 
   @override
   GrpcTransportStream makeRequest(String path, Duration? timeout,
       Map<String, String> metadata, ErrorHandler onError,
       {CallOptions? callOptions}) {
-    // gRPC-web headers.
     if (_getContentTypeHeader(metadata) == null) {
       metadata['Content-Type'] = 'application/grpc-web+proto';
       metadata['X-User-Agent'] = 'grpc-web-dart/0.1';
@@ -180,6 +184,7 @@ class XhrClientConnection implements ClientConnection {
     }
 
     var requestUri = uri.resolve(path);
+
     if (callOptions is WebCallOptions &&
         callOptions.bypassCorsPreflight == true) {
       requestUri = cors.moveHttpHeadersToQueryParam(metadata, requestUri);
@@ -187,10 +192,11 @@ class XhrClientConnection implements ClientConnection {
 
     final request = createHttpRequest();
     request.open('POST', requestUri.toString());
+
     if (callOptions is WebCallOptions && callOptions.withCredentials == true) {
       request.withCredentials = true;
     }
-    // Must set headers after calling open().
+
     _initializeRequest(request, metadata);
 
     final transportStream =
@@ -231,4 +237,18 @@ MapEntry<String, String>? _getContentTypeHeader(Map<String, String> metadata) {
     }
   }
   return null;
+}
+
+Map<String, String> parseHeaders(String rawHeaders) {
+  final headers = <String, String>{};
+  final lines = rawHeaders.split('\r\n');
+  for (var line in lines) {
+    final index = line.indexOf(': ');
+    if (index != -1) {
+      final key = line.substring(0, index);
+      final value = line.substring(index + 2);
+      headers[key] = value;
+    }
+  }
+  return headers;
 }
